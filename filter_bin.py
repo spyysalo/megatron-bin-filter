@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from argparse import ArgumentParser
 from tqdm import tqdm
 
+from rbloom import Bloom
+
 
 # Megatron-LM indexed dataset `.idx` file header
 _INDEX_HEADER = b'MMIDIDX\x00\x00'
@@ -126,21 +128,20 @@ def main():
     subset_bin_fn, subset_idx_fn = bin_and_idx_paths(args.subset)
     subset_idx = IndexReader(subset_idx_fn)
 
-    # Store hashes of subset documents
-    counts = defaultdict(int)
+    # Store hashes in bloom filter
+    bloom_filter = Bloom(subset_idx.sequence_count, 0.01)
     for data in tqdm(BinIterator(subset_bin_fn, subset_idx),
                      total=subset_idx.sequence_count,
                      desc="Hashing subset"):
-        counts[hash_array(data)] += 1
-    logging.info(f'stored {len(counts)} hashes for {subset_idx.sequence_count} sequences (collision rate {1-len(counts)/subset_idx.sequence_count:.4%})')
+        bloom_filter.add(hash_array(data))
     subset_idx = None
 
     # Load index of full data
     full_bin_fn, full_idx_fn = bin_and_idx_paths(args.full)
     full_idx = IndexReader(full_idx_fn)
 
-    # Process full data documents, writing out ones whose hashes do
-    # not hit the subset hashes and storing lengths for output index
+    # Process full data documents, writing out ones not found in the
+    # bloom filter and storing lengths for output index
     out_bin_fn, out_idx_fn = bin_and_idx_paths(args.out)
     out_sequence_lengths = []
     hits, misses = 0, 0
@@ -149,15 +150,14 @@ def main():
                          total=full_idx.sequence_count,
                          desc="Processing full"):
             h = hash_array(data)
-            if h in counts:
+            if h in bloom_filter:
                 hits += 1
-                counts[h] -= 1
             else:
                 misses += 1
                 data.tofile(out_bin)
                 out_sequence_lengths.append(data.shape[0])
     logging.info(f'{hits} hits, {misses} misses')
-    logging.info(f'wrote {out_bin_fn}')
+    logging.info(f'wrote {out_bin_fn} with {len(out_sequence_lengths)} documents.')
 
     # write output index (following Megatron-LM _IndexWriter)
     with open(out_idx_fn, 'wb') as out_idx:
@@ -189,7 +189,7 @@ def main():
         document_indices = np.array(document_indices, dtype=np.int64)
         out_idx.write(document_indices.tobytes(order='C'))
         del document_indices
-    logging.info(f'wrote {out_idx_fn}')
+    logging.info(f'wrote {out_idx_fn}.')
     logging.info('done.')
 
     return 0
